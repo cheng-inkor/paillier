@@ -1,0 +1,902 @@
+
+// MonPro module
+// follow this algorithm: http://cs.ucsb.edu/~koc/cs290g/docs/w01/mon1.pdf
+
+`timescale 1ns/1ps
+`include "../rtl/_parameter.v"
+ 
+ 
+module ModExp #(
+    parameter   DATA_WIDTH = 128,
+    parameter   DATA_NUMBER = 32
+)
+(
+    input clk,
+    input rst_n,
+    input startInput,   
+    input startCompute, 
+    input getResult,    
+    input [DATA_WIDTH - 1 : 0] m_buf,  
+    input [DATA_WIDTH - 1 : 0] e_buf,
+    input [DATA_WIDTH - 1 : 0] n_buf, 
+	input [DATA_WIDTH - 1 : 0] r_buf, 
+	input [DATA_WIDTH - 1 : 0] t_buf, 
+	input [DATA_WIDTH - 1 : 0] nprime0,
+    output reg [3 : 0] state,
+    output reg [4 : 0] exp_state,   //  for MonExp
+    output reg [DATA_WIDTH - 1 : 0] res_out
+);
+ 
+    reg [DATA_WIDTH - 1 : 0] m_in [DATA_NUMBER - 1 : 0];   // for m input
+    reg [DATA_WIDTH - 1 : 0] r_in [DATA_NUMBER - 1 : 0];   // for r input
+    reg [DATA_WIDTH - 1 : 0] t_in [DATA_NUMBER - 1 : 0];   // for t input
+    reg [DATA_WIDTH - 1 : 0] e_in [DATA_NUMBER - 1 : 0];   // for e input
+    reg [DATA_WIDTH - 1 : 0] n_in [DATA_NUMBER - 1 : 0];   // for n input, i think if we need n^2, best way to deal with this is set total_addr*2 -1 and mul n_buf it self.
+    
+    reg [DATA_WIDTH - 1 : 0] m_bar [DATA_NUMBER - 1 : 0];  // multiple usage, to save regs
+    reg [DATA_WIDTH - 1 : 0] c_bar [DATA_NUMBER - 1 : 0];  // multiple usage, to save regs
+    
+    reg [DATA_WIDTH - 1 : 0] z;
+    reg [DATA_WIDTH - 1 : 0] v [DATA_NUMBER + 1 : 0];
+    reg [DATA_WIDTH - 1 : 0] m;
+    // Declare states
+    localparam S0 = 0, S1 = 1, S2 = 2, S3 = 3, S4 = 4, S5 = 5, S6 = 6, S7 = 7;
+    
+    localparam INIT_STATE = 0, LOAD_M_E = 1, LOAD_N = 2, WAIT_COMPUTE = 3, CALC_M_BAR = 4, GET_K_E = 5, BIGLOOP = 6, CALC_C_BAR_M_BAR = 7, CALC_C_BAR_1 = 8, COMPLETE = 9, OUTPUT_RESULT = 10, TERMINAL = 11;
+                            
+    integer i;  // big loop i
+    integer j;
+    integer k;
+    integer k_e1;
+    integer k_e2;
+    
+    reg [DATA_WIDTH - 1 : 0] x0;
+    reg [DATA_WIDTH - 1 : 0] y0;
+    reg [DATA_WIDTH - 1 : 0] z0;
+    reg [DATA_WIDTH - 1 : 0] last_c0;    
+    wire [DATA_WIDTH - 1 : 0] s0;
+    wire [DATA_WIDTH - 1 : 0] c0;
+	
+    mul_add #(
+        .DATA_WIDTH(DATA_WIDTH)
+    )
+    mul_add0 (.clk(clk), .x(x0), .y(y0), .z(z0), .last_c(last_c0), 
+                .s(s0), .c(c0));
+ 
+ 
+    always @ (posedge clk or negedge rst_n) begin
+        if (!rst_n) begin    // reset all...
+            for(i = 0; i < DATA_NUMBER + 2; i = i + 1) begin
+                v[i] = `DATA_WIDTH'h0000000000000000;
+            end
+            for(i = 0; i <DATA_NUMBER; i = i + 1) begin
+                m_in[i] = `DATA_WIDTH'h0000000000000000;
+                e_in[i] = `DATA_WIDTH'h0000000000000000;
+				r_in[i] = `DATA_WIDTH'h0000000000000000;
+                t_in[i] = `DATA_WIDTH'h0000000000000000;
+				n_in[i] = `DATA_WIDTH'h0000000000000000;
+				m_bar[i] = `DATA_WIDTH'h0000000000000000;
+				c_bar[i] = `DATA_WIDTH'h0000000000000000;
+            end
+            res_out = `DATA_WIDTH'h0000000000000000;
+            z = `DATA_WIDTH'h0000000000000000;   // initial C = 0
+			m = `DATA_WIDTH'h0000000000000000;
+			x0 = `DATA_WIDTH'h0000000000000000;
+			y0 = `DATA_WIDTH'h0000000000000000;
+			z0 = `DATA_WIDTH'h0000000000000000;
+			last_c0 = `DATA_WIDTH'h0000000000000000;
+            i = 0;
+            j = 0;
+            k = 0;
+            state = S0;
+            exp_state = INIT_STATE;
+            k_e1 = DATA_NUMBER - 1;
+            k_e2 = DATA_WIDTH - 1;
+        end
+        else begin
+            case (exp_state)
+                INIT_STATE: // initial state
+                begin
+                    if(startInput) begin
+                        exp_state = LOAD_M_E;
+					end
+                end
+            
+                LOAD_M_E:   // read in and initialize m, e
+                begin       
+                    if(i <= DATA_NUMBER) begin
+                        m_in[i] = m_buf;
+                        e_in[i] = e_buf;
+                        n_in[i] = n_buf; 
+						r_in[i] = r_buf; 
+						t_in[i] = t_buf;
+                        
+                        i = i + 1;
+                    end
+                    else begin
+                        i = 0;
+                        exp_state = WAIT_COMPUTE;
+                    end
+                end
+                
+            
+                WAIT_COMPUTE:
+                begin
+                    if(startCompute) begin
+                        exp_state = CALC_M_BAR;     
+                    end                 
+                end
+                
+                CALC_M_BAR: // calculate m_bar = MonPro(m, t) and copy: c_bar = r
+                begin
+                    case (state)
+                        S0: 
+                        begin   // vector(v) = x[0] * y + prev[vector(v)] + z
+                            if(k == 0) begin    // first clock: initial input 
+                                // initial a new multiplier computation
+                                x0 <= m_in[i];   // due to s5, this place need to be i
+                                y0 <= t_in[j];
+                                z0 <= v[j];
+                                last_c0 <= z;
+                                k = 1;
+                            end 
+                            else if(k == 1) begin   // second clock: store output
+                                // store the output of multiplier
+                                v[j] <= s0;
+                                z <= c0;
+                                j = j + 1;
+                                if(j == DATA_NUMBER) begin  // loop end
+                                    j = 0;
+                                    state = S1;
+                                end
+                                k = 0;
+                            end 
+                        end
+                        
+                        S1:
+                        begin // (C, S) = v[s] + C, v[s] = S, v[s + 1] = C
+                            if(k == 0) begin    // first clock: initial input 
+                                x0 <= `DATA_WIDTH'h0000000000000000;
+                                y0 <= `DATA_WIDTH'h0000000000000000;
+                                z0 <= v[DATA_NUMBER];
+                                last_c0 <= z;
+                                k = 1;
+                            end 
+                            else if(k == 1) begin
+                                v[DATA_NUMBER] <= s0;
+                                v[DATA_NUMBER + 1] <= c0;
+                                state = S2;
+                                k = 0;
+                            end 
+                        end
+                        
+                        S2:
+                        begin // m = (v[0] * n0_prime) mod 2^w  ? where is mod 2^w? w may indicate width, which means this place we need mod 2^64, can be replaced by >> width
+                            if(k == 0) begin    // first clock: initial input 
+                                x0 <= v[0];
+                                y0 <= nprime0;
+                                z0 <= `DATA_WIDTH'h0000000000000000;
+                                last_c0 <= `DATA_WIDTH'h0000000000000000;
+                                k = 1;
+                            end
+                            else if(k == 1) begin
+                                m <= s0;    
+                                state = S3;
+                                k = 0;
+                            end
+                        end
+                        
+                        S3: 
+                        begin // vector(v) = (m * vector(n) + vector(v)) >> WIDTH  == (m*vector(n)) >> width + (vector(v)) >> width
+                        // (C, S) = v[0] + m * n[0]
+                            if(j == 0) begin
+                                if(k == 0) begin    // first clock: initial input 
+                                    x0 <= m;
+                                    y0 <= n_in[0];
+                                    z0 <= v[0];
+                                    last_c0 <= `DATA_WIDTH'h0000000000000000;
+                                    k = 1;
+                                end     
+                                else if(k == 1) begin
+                                    z <= c0;    
+                                    j = j + 1;
+                                    k = 0;
+                                end
+                            end
+                            else begin
+                                if(k == 0) begin
+                                    x0 <= m;
+                                    y0 <= n_in[j];
+                                    z0 <= v[j];
+                                    last_c0 <= z;
+                                    k = 1;
+                                end
+                                else if(k == 1) begin
+                                    v[j - 1] <= s0;
+                                    z <= c0;    
+                                    j = j + 1;                      
+                                    if(j == DATA_NUMBER) begin
+                                        j = 0;
+                                        state = S4;
+                                    end
+                                    k = 0;
+                                end
+                            end
+                        end
+                        
+                        S4:
+                        begin //    (C, S) = v[s] + C, v[s - 1] = S
+                            if(k == 0) begin
+                                x0 <= `DATA_WIDTH'h0000000000000000;
+                                y0 <= `DATA_WIDTH'h0000000000000000;
+                                z0 <= v[DATA_NUMBER];
+                                last_c0 <= z;
+                                k = 1;
+                            end
+                            else if(k == 1) begin
+                                v[DATA_NUMBER - 1] <= s0;
+                                z <= c0;    
+                                state = S5;
+                                k = 0;
+                            end
+                        end
+                        
+                        S5:
+                        begin // v[s] = v[s + 1] + C
+                            if(k == 0) begin
+                                x0 <= `DATA_WIDTH'h0000000000000000;
+                                y0 <= `DATA_WIDTH'h0000000000000000;
+                                z0 <= v[DATA_NUMBER + 1];
+                                last_c0 <= z;
+                                k = 1;
+                            end
+                            else if(k == 1) begin
+                                v[DATA_NUMBER] <= s0;
+                                i = i + 1;
+                                state = S0;
+                                if(i >= DATA_NUMBER) begin  // end
+                                    state = S6;
+                                    i = 0;
+                                end
+                                k = 0;
+                            end
+                        end
+                        
+                        S6:
+                        begin
+                            //  $display("Exp_state=ES0\tIn State S6!");
+                            // prepare end state, update output, and set all to default
+                            // store into m_bar and c_bar
+                            for(i = 0; i < DATA_NUMBER; i = i + 1) begin
+                                m_bar[i] = v[i];
+                            end
+                            for(i = 0; i < DATA_NUMBER; i = i + 1) begin
+                                c_bar[i] = r_in[i];
+                            end
+                            for(i = 0; i < DATA_NUMBER + 2; i = i + 1) begin
+                                v[i] = `DATA_WIDTH'h0000000000000000;
+                            end
+                            z = `DATA_WIDTH'h0000000000000000;
+                            i = 0;
+                            j = 0;
+                            k = 0;
+                            state = S7;
+                        end
+                        
+                        S7:
+                        begin
+                            exp_state = GET_K_E;    // go to next state
+                            state = S0;
+                        end
+                    endcase
+                end
+            
+                GET_K_E:    // a clock to initial the leftmost 1 in e = k_e
+                begin
+                    if(e_in[k_e1][k_e2] == 1) begin
+                        //  $display("e_in[%d][%d] = %d", k_e1, k_e2, e_in[k_e1][k_e2]);
+                        exp_state = BIGLOOP;
+                    end
+                    else begin
+                        if(k_e2 == 0) begin
+                            k_e1 = k_e1 - 1;
+                            k_e2 = DATA_WIDTH - 1;
+                        end
+                        else begin
+                            k_e2 = k_e2 - 1;
+                        end
+                    end
+                end
+            
+                BIGLOOP:    // for i = k_e1 * `DATA_WIDTH + k_e2 downto 0
+                begin
+                    case (state)    // c_bar = MonPro(c_bar, c_bar)
+                        S0: 
+                        begin   // vector(v) = x[0] * y + prev[vector(v)] + z
+                            if(k == 0) begin    // first clock: initial input 
+                                // initial a new multiplier computation
+                                x0 <= c_bar[i];
+                                y0 <= c_bar[j];
+                                z0 <= v[j];
+                                last_c0 <= z;
+                                k = 1;
+                            end 
+                            else if(k == 1) begin   // second clock: store output
+                                // store the output of multiplier
+                                v[j] <= s0;
+                                z <= c0;
+                                j = j + 1;
+                                if(j == DATA_NUMBER) begin  // loop end
+                                    j = 0;
+                                    state = S1;
+                                end
+                                k = 0;
+                            end 
+                        end
+                        
+                        S1:
+                        begin // (C, S) = v[s] + C, v[s] = S, v[s + 1] = C
+                            if(k == 0) begin    // first clock: initial input 
+                                x0 <= `DATA_WIDTH'h0000000000000000;
+                                y0 <= `DATA_WIDTH'h0000000000000000;
+                                z0 <= v[DATA_NUMBER];
+                                last_c0 <= z;
+                                k = 1;
+                            end 
+                            else if(k == 1) begin
+                                v[DATA_NUMBER] <= s0;
+                                v[DATA_NUMBER + 1] <= c0;
+                                state = S2;
+                                k = 0;
+                            end 
+                        end
+                        
+                        S2:
+                        begin // m = (v[0] * n0_prime) mod 2^w
+                            if(k == 0) begin    // first clock: initial input 
+                                x0 <= v[0];
+                                y0 <= nprime0;
+                                z0 <= `DATA_WIDTH'h0000000000000000;
+                                last_c0 <= `DATA_WIDTH'h0000000000000000;
+                                k = 1;
+                            end
+                            else if(k == 1) begin
+                                m <= s0;    
+                                state = S3;
+                                k = 0;
+                            end
+                        end
+                        
+                        S3: 
+                        begin // vector(v) = (m * vector(n) + vector(v)) >> WIDTH
+                        // (C, S) = v[0] + m * n[0]
+                            if(j == 0) begin
+                                if(k == 0) begin    // first clock: initial input 
+                                    x0 <= m;
+                                    y0 <= n_in[0];
+                                    z0 <= v[0];
+                                    last_c0 <= `DATA_WIDTH'h0000000000000000;
+                                    k = 1;
+                                end     
+                                else if(k == 1) begin
+                                    z <= c0;    
+                                    j = j + 1;
+                                    k = 0;
+                                end
+                            end
+                            else begin
+                                if(k == 0) begin
+                                    x0 <= m;
+                                    y0 <= n_in[j];
+                                    z0 <= v[j];
+                                    last_c0 <= z;
+                                    k = 1;
+                                end
+                                else if(k == 1) begin
+                                    v[j - 1] <= s0;
+                                    z <= c0;    
+                                    j = j + 1;                      
+                                    if(j == DATA_NUMBER) begin
+                                        j = 0;
+                                        state = S4;
+                                    end
+                                    k = 0;
+                                end
+                            end
+                        end
+                        
+                        S4:
+                        begin //    (C, S) = v[s] + C, v[s - 1] = S
+                            if(k == 0) begin
+                                x0 <= `DATA_WIDTH'h0000000000000000;
+                                y0 <= `DATA_WIDTH'h0000000000000000;
+                                z0 <= v[DATA_NUMBER];
+                                last_c0 <= z;
+                                k = 1;
+                            end
+                            else if(k == 1) begin
+                                v[DATA_NUMBER - 1] <= s0;
+                                z <= c0;    
+                                state = S5;
+                                k = 0;
+                            end
+                        end
+                        
+                        S5:
+                        begin // v[s] = v[s + 1] + C
+                            if(k == 0) begin
+                                x0 <= `DATA_WIDTH'h0000000000000000;
+                                y0 <= `DATA_WIDTH'h0000000000000000;
+                                z0 <= v[DATA_NUMBER + 1];
+                                last_c0 <= z;
+                                k = 1;
+                            end
+                            else if(k == 1) begin
+                                v[DATA_NUMBER] <= s0;
+                                i = i + 1;
+                                state = S0;
+                                if(i >= DATA_NUMBER) begin  // end
+                                    state = S6;
+                                    i = 0;
+                                end
+                                k = 0;
+                            end
+                        end
+                        
+                        S6:
+                        begin
+                            //  $display("Exp_state=ES2\tIn State S6!");
+                            // prepaer end state, update output, and set all to default
+                            // store into m_bar and c_bar
+                            for(i = 0; i < DATA_NUMBER; i = i + 1) begin
+                                c_bar[i] = v[i];
+                            end
+                            for(i = 0; i < DATA_NUMBER + 2; i = i + 1) begin
+                                v[i] = `DATA_WIDTH'h0000000000000000;
+                            end
+                            z = `DATA_WIDTH'h0000000000000000;
+                            i = 0;
+                            j = 0;
+                            k = 0;
+                            state = S7;
+                        end
+                        
+                        S7:
+                        begin
+                            //  $display("k_e1: %d, k_e2: %d", k_e1, k_e2);
+                            if(e_in[k_e1][k_e2] == 1) begin
+                                exp_state = CALC_C_BAR_M_BAR;   // go to c_bar = MonPro(c_bar, m_bar)
+                            end
+                            else begin
+                                if(k_e1 <= 0 && k_e2 <= 0)
+                                    exp_state = CALC_C_BAR_1;
+                                else if(k_e2 == 0) begin    // down 1 of e
+                                    k_e1 = k_e1 - 1;
+                                    k_e2 = DATA_WIDTH - 1;
+                                end else
+                                    k_e2 = k_e2 - 1;
+                            end
+                            state = S0;
+                        end
+                    endcase             
+                end
+                
+                CALC_C_BAR_M_BAR:   // c_bar = MonPro(c_bar, m_bar)
+                begin
+                    case (state)    // c_bar = MonPro(c_bar, c_bar)
+                        S0: 
+                        begin   // vector(v) = x[0] * y + prev[vector(v)] + z
+                            if(k == 0) begin    // first clock: initial input 
+                                // initial a new multiplier computation
+                                x0 <= c_bar[i];
+                                y0 <= m_bar[j];
+                                z0 <= v[j];
+                                last_c0 <= z;
+                                k = 1;
+                            end 
+                            else if(k == 1) begin   // second clock: store output
+                                // store the output of multiplier
+                                v[j] <= s0;
+                                z <= c0;
+                                j = j + 1;
+                                if(j == DATA_NUMBER) begin  // loop end
+                                    j = 0;
+                                    state = 1;
+                                end
+                                k = 0;
+                            end 
+                        end
+                        
+                        S1:
+                        begin // (C, S) = v[s] + C, v[s] = S, v[s + 1] = C
+                            if(k == 0) begin    // first clock: initial input 
+                                x0 <= `DATA_WIDTH'h0000000000000000;
+                                y0 <= `DATA_WIDTH'h0000000000000000;
+                                z0 <= v[DATA_NUMBER];
+                                last_c0 <= z;
+                                k = 1;
+                            end 
+                            else if(k == 1) begin
+                                v[DATA_NUMBER] <= s0;
+                                v[DATA_NUMBER + 1] <= c0;
+                                state = S2;
+                                k = 0;
+                            end 
+                        end
+                        
+                        S2:
+                        begin // m = (v[0] * n0_prime) mod 2^w
+                            if(k == 0) begin    // first clock: initial input 
+                                x0 <= v[0];
+                                y0 <= nprime0;
+                                z0 <= `DATA_WIDTH'h0000000000000000;
+                                last_c0 <= `DATA_WIDTH'h0000000000000000;
+                                k = 1;
+                            end
+                            else if(k == 1) begin
+                                m <= s0;    
+                                state = S3;
+                                k = 0;
+                            end
+                        end
+                        
+                        S3: 
+                        begin // vector(v) = (m * vector(n) + vector(v)) >> WIDTH
+                        // (C, S) = v[0] + m * n[0]
+                            if(j == 0) begin
+                                if(k == 0) begin    // first clock: initial input 
+                                    x0 <= m;
+                                    y0 <= n_in[0];
+                                    z0 <= v[0];
+                                    last_c0 <= `DATA_WIDTH'h0000000000000000;
+                                    k = 1;
+                                end     
+                                else if(k == 1) begin
+                                    z <= c0;    
+                                    j = j + 1;
+                                    k = 0;
+                                end
+                            end
+                            else begin
+                                if(k == 0) begin
+                                    x0 <= m;
+                                    y0 <= n_in[j];
+                                    z0 <= v[j];
+                                    last_c0 <= z;
+                                    k = 1;
+                                end
+                                else if(k == 1) begin
+                                    v[j - 1] <= s0;
+                                    z <= c0;    
+                                    j = j + 1;                      
+                                    if(j == DATA_NUMBER) begin
+                                        j = 0;
+                                        state = S4;
+                                    end
+                                    k = 0;
+                                end
+                            end
+                        end
+                        
+                        S4:
+                        begin //    (C, S) = v[s] + C, v[s - 1] = S
+                            if(k == 0) begin
+                                x0 <= `DATA_WIDTH'h0000000000000000;
+                                y0 <= `DATA_WIDTH'h0000000000000000;
+                                z0 <= v[DATA_NUMBER];
+                                last_c0 <= z;
+                                k = 1;
+                            end
+                            else if(k == 1) begin
+                                v[DATA_NUMBER - 1] <= s0;
+                                z <= c0;    
+                                state = S5;
+                                k = 0;
+                            end
+                        end
+                        
+                        S5:
+                        begin // v[s] = v[s + 1] + C
+                            if(k == 0) begin
+                                x0 <= `DATA_WIDTH'h0000000000000000;
+                                y0 <= `DATA_WIDTH'h0000000000000000;
+                                z0 <= v[DATA_NUMBER + 1];
+                                last_c0 <= z;
+                                k = 1;
+                            end
+                            else if(k == 1) begin
+                                v[DATA_NUMBER] <= s0;
+                                i = i + 1;
+                                state = S0;
+                                if(i >= DATA_NUMBER) begin  // end
+                                    state = S6;
+                                    i = 0;
+                                end
+                                k = 0;
+                            end
+                        end
+                        
+                        S6:
+                        begin
+                            //  $display("Exp_state=ES3\tIn State S6!");
+                            // prepare end state, update output, and set all to default
+                            // store into m_bar and c_bar
+                            for(i = 0; i < DATA_NUMBER; i = i + 1) begin
+                                c_bar[i] = v[i];
+                            end
+                            for(i = 0; i < DATA_NUMBER + 2; i = i + 1) begin
+                                v[i] = `DATA_WIDTH'h0000000000000000;
+                            end
+                            z = `DATA_WIDTH'h0000000000000000;
+                            i = 0;
+                            j = 0;
+                            k = 0;
+                            state = S7;
+                        end
+                        
+                        S7:
+                        begin
+                            if(k_e1 <= 0 && k_e2 <= 0) begin
+                                exp_state = CALC_C_BAR_1;
+                                state = S0;
+                            end
+                            else begin
+                                if(k_e2 == 0) begin // down 1 of e
+                                    k_e1 = k_e1 - 1;
+                                    k_e2 = DATA_WIDTH - 1;
+                                end else
+                                    k_e2 = k_e2 - 1;
+                                exp_state = BIGLOOP;
+                                state = S0;
+                            end
+                        end
+                    endcase                 
+                end
+                
+                CALC_C_BAR_1:   // c = MonPro(1, c_bar)
+                begin
+                    case (state)    // c_bar = MonPro(c_bar, c_bar)
+                        S0: 
+                        begin   // vector(v) = x[0] * y + prev[vector(v)] + z
+                            if(i == 0) begin
+                                if(k == 0) begin    // first clock: initial input 
+                                    // initial a new multiplier computation
+                                    x0 <= `DATA_WIDTH'h0000000000000001;
+                                    y0 <= c_bar[j];
+                                    z0 <= v[j];
+                                    last_c0 <= z;
+                                    k = 1;
+                                end 
+                                else if(k == 1) begin   // second clock: store output
+                                    // store the output of multiplier
+                                    v[j] <= s0;
+                                    z <= c0;
+                                    j = j + 1;
+                                    if(j == DATA_NUMBER) begin  // loop end
+                                        j = 0;
+                                        state = S1;
+                                    end
+                                    k = 0;
+                                end 
+                            end
+                            else begin
+                                if(k == 0) begin    // first clock: initial input 
+                                    // initial a new multiplier computation
+                                    x0 <= `DATA_WIDTH'h0000000000000000;
+                                    y0 <= c_bar[j];
+                                    z0 <= v[j];
+                                    last_c0 <= z;
+                                    k = 1;
+                                end 
+                                else if(k == 1) begin   // second clock: store output
+                                    // store the output of multiplier
+                                    v[j] <= s0;
+                                    z <= c0;
+                                    j = j + 1;
+                                    if(j == DATA_NUMBER) begin  // loop end
+                                        j = 0;
+                                        state = S1;
+                                    end
+                                    k = 0;
+                                end     
+                            end
+                        end
+                        
+                        S1:
+                        begin // (C, S) = v[s] + C, v[s] = S, v[s + 1] = C
+                            if(k == 0) begin    // first clock: initial input 
+                                x0 <= `DATA_WIDTH'h0000000000000000;
+                                y0 <= `DATA_WIDTH'h0000000000000000;
+                                z0 <= v[DATA_NUMBER];
+                                last_c0 <= z;
+                                k = 1;
+                            end 
+                            else if(k == 1) begin
+                                v[DATA_NUMBER] <= s0;
+                                v[DATA_NUMBER + 1] <= c0;
+                                state = S2;
+                                k = 0;
+                            end 
+                        end
+                        
+                        S2:
+                        begin // m = (v[0] * n0_prime) mod 2^w
+                            if(k == 0) begin    // first clock: initial input 
+                                x0 <= v[0];
+                                y0 <= nprime0;
+                                z0 <= `DATA_WIDTH'h0000000000000000;
+                                last_c0 <= `DATA_WIDTH'h0000000000000000;
+                                k = 1;
+                            end
+                            else if(k == 1) begin
+                                m <= s0;    
+                                state = S3;
+                                k = 0;
+                            end
+                        end
+                        
+                        S3: 
+                        begin // vector(v) = (m * vector(n) + vector(v)) >> WIDTH
+                        // (C, S) = v[0] + m * n[0]
+                            if(j == 0) begin
+                                if(k == 0) begin    // first clock: initial input 
+                                    x0 <= m;
+                                    y0 <= n_in[0];
+                                    z0 <= v[0];
+                                    last_c0 <= `DATA_WIDTH'h0000000000000000;
+                                    k = 1;
+                                end     
+                                else if(k == 1) begin
+                                    z <= c0;    
+                                    j = j + 1;
+                                    k = 0;
+                                end
+                            end
+                            else begin
+                                if(k == 0) begin
+                                    x0 <= m;
+                                    y0 <= n_in[j];
+                                    z0 <= v[j];
+                                    last_c0 <= z;
+                                    k = 1;
+                                end
+                                else if(k == 1) begin
+                                    v[j - 1] <= s0;
+                                    z <= c0;    
+                                    j = j + 1;                      
+                                    if(j == DATA_NUMBER) begin
+                                        j = 0;
+                                        state = S4;
+                                    end
+                                    k = 0;
+                                end
+                            end
+                        end
+                        
+                        S4:
+                        begin //    (C, S) = v[s] + C, v[s - 1] = S
+                            if(k == 0) begin
+                                x0 <= `DATA_WIDTH'h0000000000000000;
+                                y0 <= `DATA_WIDTH'h0000000000000000;
+                                z0 <= v[DATA_NUMBER];
+                                last_c0 <= z;
+                                k = 1;
+                            end
+                            else if(k == 1) begin
+                                v[DATA_NUMBER - 1] <= s0;
+                                z <= c0;    
+                                state = S5;
+                                k = 0;
+                            end
+                        end
+                        
+                        S5:
+                        begin // v[s] = v[s + 1] + C
+                            if(k == 0) begin
+                                x0 <= `DATA_WIDTH'h0000000000000000;
+                                y0 <= `DATA_WIDTH'h0000000000000000;
+                                z0 <= v[DATA_NUMBER + 1];
+                                last_c0 <= z;
+                                k = 1;
+                            end
+                            else if(k == 1) begin
+                                v[DATA_NUMBER] <= s0;
+                                i = i + 1;
+                                state = S0;
+                                if(i >= DATA_NUMBER) begin  // end
+                                    state = S6;
+                                    i = 0;
+                                end
+                                k = 0;
+                            end
+                        end
+                        
+                        S6:
+                        begin
+                            //  $display("Exp_state=ES4\tIn State S6!");
+                            // prepare end state, update output, and set all to default
+                            // store into m_bar and c_bar
+                            for(i = 0; i < DATA_NUMBER; i = i + 1) begin
+                                c_bar[i] = v[i];
+                            end
+                            for(i = 0; i < DATA_NUMBER + 2; i = i + 1) begin
+                                v[i] = 0;
+                            end
+                            z = `DATA_WIDTH'h0000000000000000;
+                            i = 0;
+                            j = 0;
+                            k = 0;
+                            state = S7;
+                        end
+                        
+                        S7:
+                        begin
+                            exp_state = COMPLETE;   // end state of exp!
+                            state = S0;
+ 
+                            // $display("******************************");
+                        end
+                    endcase     
+                end
+                
+                COMPLETE:
+                begin
+                    if(getResult) begin
+                        exp_state = OUTPUT_RESULT;
+                    end             
+                end
+                
+                OUTPUT_RESULT:  // output 4096 bits result (c_bar) to output buffer!
+                begin
+                    if(i < DATA_NUMBER) begin
+                        res_out = c_bar[i];
+                        $display("count %d 0x%h ", i, c_bar[i]);
+                        i = i + 1;
+                    end
+                    else begin
+                        exp_state = TERMINAL;
+                        i = 0;
+                        res_out = `DATA_WIDTH'h0000000000000000;
+                    end
+                end
+                
+                TERMINAL:
+                begin
+					k = 0;
+					state = S0;
+					exp_state = INIT_STATE;
+                    res_out = `DATA_WIDTH'h0000000000000000;
+ 
+					for(i = 0; i < DATA_NUMBER + 2; i = i + 1) begin
+						v[i] = `DATA_WIDTH'h0000000000000000;
+					end
+					for(i = 0; i < DATA_NUMBER; i = i + 1) begin
+						m_in[i] = `DATA_WIDTH'h0000000000000000;
+						e_in[i] = `DATA_WIDTH'h0000000000000000;
+						r_in[i] = `DATA_WIDTH'h0000000000000000;
+						t_in[i] = `DATA_WIDTH'h0000000000000000;
+						n_in[i] = `DATA_WIDTH'h0000000000000000;
+						m_bar[i] = `DATA_WIDTH'h0000000000000000;
+						c_bar[i] = `DATA_WIDTH'h0000000000000000;
+					end
+					res_out = `DATA_WIDTH'h0000000000000000;
+					z = `DATA_WIDTH'h0000000000000000;   // initial C = 0
+					m = `DATA_WIDTH'h0000000000000000;
+					x0 = `DATA_WIDTH'h0000000000000000;
+					y0 = `DATA_WIDTH'h0000000000000000;
+					z0 = `DATA_WIDTH'h0000000000000000;
+					last_c0 = `DATA_WIDTH'h0000000000000000;
+					i = 0;
+					j = 0;
+					k = 0;
+					state = S0;
+					exp_state = INIT_STATE;
+					k_e1 = DATA_NUMBER - 1;
+					k_e2 = DATA_WIDTH - 1;					
+                end
+            endcase
+        end
+    end
+    
+endmodule
+ 
